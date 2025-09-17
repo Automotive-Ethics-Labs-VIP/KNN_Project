@@ -22,7 +22,7 @@ def resize_images(category):
             img_path = os.path.join(input_path, filename)
             img = Image.open(img_path).convert("RGB")  # ensure 3 channels
             # img = img.resize((32, 32), Image.ANTIALIAS)
-            img = img.resize((32, 32), Image.Resampling.LANCZOS)
+            img = img.resize((64, 64), Image.Resampling.LANCZOS)
             img.save(os.path.join(output_path, filename), optimize=True, quality=85)
 
 # Run for all categories

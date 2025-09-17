@@ -20,7 +20,7 @@ The project classifies the following real-world objects:
 - Pedestrians
 - Cyclists
 
-All images should be compressed to 64x64 pixels** for consistency.
+All images should be compressed to **64x64 pixels** for consistency.
 
 ## Implementation Steps
 

@@ -6,7 +6,7 @@ RAW_DATA_DIR = "raw_data"
 OUTPUT_DIR = "data"
 
 # Categories you want
-categories = ["cars", "trucks", "motorcycles", "pedestrians", "cyclists"]
+categories = ["cars", "trucks", "cyclists", "pedestrians", "motorcycles"]
 
 # Make sure output folders exist
 for category in categories:

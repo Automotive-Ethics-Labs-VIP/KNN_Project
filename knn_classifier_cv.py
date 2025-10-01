@@ -11,6 +11,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import (classification_report, confusion_matrix, accuracy_score,
                              balanced_accuracy_score, f1_score)
 
+from skimage.feature import hog
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import StandardScaler
+
 np.random.seed(42)
 
 # -------------------------------
@@ -103,6 +107,48 @@ def show_class_counts(y, cats):
     counts = Counter(y.tolist())
     print("Class counts:", {cats[k]: counts.get(k,0) for k in range(len(cats))})
 
+# ---- HOG transformer (works inside Pipeline) ----
+from sklearn.base import BaseEstimator, TransformerMixin
+from skimage.feature import hog
+import numpy as np
+
+class HOGTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, image_size=(64, 64),
+                 pixels_per_cell=(8, 8),
+                 cells_per_block=(2, 2),
+                 orientations=9,
+                 luminance_weights=True):
+        self.image_size = image_size
+        self.pixels_per_cell = pixels_per_cell     # <-- match param name
+        self.cells_per_block = cells_per_block     # <-- match param name
+        self.orientations = orientations
+        self.luminance_weights = luminance_weights
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        H, W = self.image_size
+        x = X.reshape(-1, H, W, 3)
+        if self.luminance_weights:
+            # standard luma instead of simple mean
+            Xg = 0.299 * x[:, :, :, 0] + 0.587 * x[:, :, :, 1] + 0.114 * x[:, :, :, 2]
+        else:
+            Xg = x.mean(axis=3)
+
+        feats = []
+        for img in Xg:
+            f = hog(
+                img,
+                orientations=self.orientations,
+                pixels_per_cell=self.pixels_per_cell,
+                cells_per_block=self.cells_per_block,
+                visualize=False,
+                feature_vector=True,
+            )
+            feats.append(f)
+        return np.asarray(feats, dtype=np.float32)
+
 # -------------------------------
 # Load (with cache) and split
 # -------------------------------
@@ -127,31 +173,77 @@ except ValueError as e:
         X, y, test_size=TEST_SIZE, random_state=SEED, shuffle=True, stratify=None)
 
 # -------------------------------
-# Grid search CV on a Pipeline (PCA→KNN)
+# Two representations to compare:
+# A) RAW → PCA → KNN     (your current)
+# B) HOG → (scale) → PCA → KNN
 # -------------------------------
-pipe = Pipeline([
+raw_pca_knn = Pipeline([
     ("pca", PCA(random_state=SEED)),
     ("knn", KNeighborsClassifier(n_jobs=-1)),
 ])
 
+hog_pca_knn = Pipeline([
+    ("hog", HOGTransformer(image_size=IMAGE_SIZE, pixels_per_cell=(8,8), cells_per_block=(2,2), orientations=9)),
+    ("scaler", StandardScaler(with_mean=True, with_std=True)),
+    ("pca", PCA(random_state=SEED)),
+    ("knn", KNeighborsClassifier(n_jobs=-1)),
+])
+
+# Param grids for each branch
+RAW_PARAM_GRID = {
+    "pca__n_components": [80, 120, 150, 200],
+    "knn__n_neighbors": [3, 5, 7, 9, 11],
+    "knn__weights": ["uniform", "distance"],
+    "knn__metric": ["euclidean", "manhattan", "cosine"],
+}
+
+HOG_PARAM_GRID = {
+    "hog__pixels_per_cell": [(8,8), (12,12)],
+    "hog__cells_per_block": [(2,2), (3,3)],
+    "hog__orientations": [9, 12],
+    "pca__n_components": [50, 80, 120],  # HOG is already compact
+    "knn__n_neighbors": [5, 7, 9, 11],
+    "knn__weights": ["uniform", "distance"],
+    "knn__metric": ["euclidean", "cosine"],
+}
+
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-gs = GridSearchCV(
-    estimator=pipe,
-    param_grid=PARAM_GRID,
-    scoring=["balanced_accuracy", "f1_macro", "accuracy"],
-    refit="balanced_accuracy",  # prioritize robustness to imbalance
-    cv=cv,
-    n_jobs=-1,
-    verbose=1,
-)
 
-t0 = time.time()
-gs.fit(X_tr, y_tr)
-t1 = time.time()
-print(f"\nBest params: {gs.best_params_}")
-print(f"CV best (balanced_acc): {gs.best_score_:.4f}  | fit_time={t1-t0:.1f}s")
+def run_grid(model, grid, tag):
+    gs = GridSearchCV(
+        estimator=model,
+        param_grid=grid,
+        scoring=["balanced_accuracy","f1_macro","accuracy"],
+        refit="balanced_accuracy",
+        cv=cv,
+        n_jobs=-1,
+        verbose=1,
+    )
+    t0 = time.time()
+    gs.fit(X_tr, y_tr)
+    t1 = time.time()
+    print(f"\n[{tag}] Best params: {gs.best_params_}")
+    print(f"[{tag}] CV best (balanced_acc): {gs.best_score_:.4f}  | fit_time={t1-t0:.1f}s")
+    return gs
 
-best_model = gs.best_estimator_
+print("\n=== RAW → PCA → KNN ===")
+gs_raw = run_grid(raw_pca_knn, RAW_PARAM_GRID, "RAW")
+
+print("\n=== HOG → (scale) → PCA → KNN ===")
+gs_hog = run_grid(hog_pca_knn, HOG_PARAM_GRID, "HOG")
+
+# Pick the better one by balanced accuracy on CV first, then confirm on test
+if gs_hog.best_score_ >= gs_raw.best_score_:
+    best_model = gs_hog.best_estimator_
+    best_params = gs_hog.best_params_
+    best_tag = "HOG"
+else:
+    best_model = gs_raw.best_estimator_
+    best_params = gs_raw.best_params_
+    best_tag = "RAW"
+
+print(f"\n>>> Selected representation by CV: {best_tag}")
+
 
 # -------------------------------
 # Evaluate on held-out test set
@@ -184,11 +276,21 @@ print(cm_norm)
 # Simple error analysis: nearest neighbors for a few mistakes
 # -------------------------------
 def nearest_indices(model, Xq, k=5):
-    # access trained steps
-    pca = model.named_steps["pca"]
+    """
+    Compute neighbors for queries Xq using the trained pipeline 'model'.
+    This applies all steps before the final KNN (e.g., HOG → Scaler → PCA),
+    then runs kneighbors in the trained KNN space.
+    """
+    # Final step must be KNN
+    assert list(model.steps)[-1][0] == "knn", "Pipeline last step must be 'knn'"
+
+    # Transform queries through all pre-knn steps
+    Xt = Xq
+    for name, step in model.steps[:-1]:
+        Xt = step.transform(Xt)
+
     knn = model.named_steps["knn"]
-    Q = pca.transform(Xq)
-    dists, idxs = knn.kneighbors(Q, n_neighbors=k, return_distance=True)
+    dists, idxs = knn.kneighbors(Xt, n_neighbors=k, return_distance=True)
     return dists, idxs
 
 mist = np.where(y_te != y_pred)[0][:10]  # first 10 mistakes
@@ -208,9 +310,10 @@ bundle = {
     "image_size": IMAGE_SIZE,
     "categories": categories,
     "dataset_hash": ds_hash,       # helps trace which dataset build this model used
-    "params": gs.best_params_,
+    "params": best_params,
+    "selected_representation": best_tag,
 }
 out_path = os.path.join(MODEL_DIR, "knn_pca_pipeline.joblib")
 dump(bundle, out_path)
 print(f"\nSaved pipeline bundle → {out_path}")
-print("Bundle keys: ['model','image_size','categories','dataset_hash','params']")
+print("Bundle keys: ['model','image_size','categories','dataset_hash','params','selected_representation']")
